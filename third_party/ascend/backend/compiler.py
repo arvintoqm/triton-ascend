@@ -57,7 +57,8 @@ from triton.backends.ascend.utils import (
     downgrade_llir,
     force_disable_ffts,
     get_cann_version_file_hash,
-    is_compile_on_910_95,
+    is_910_95_family_arch,
+    is_simt_supported,
 )
 from triton.backends.ascend.driver import (NPUUtils)
 from triton.backends.compiler import (
@@ -1216,12 +1217,22 @@ class AscendBackend(BaseBackend):
             args = {k: opts[k] for k in NPUOptions.__dataclass_fields__.keys() if k in opts}
             args.setdefault("arch", self.target.arch)
             options = NPUOptions(**args)
-            # Lazy init compile_on_910_95 if not provided
+            # Kirin9020 shares the 910_95/A5 compiler path, but unlike the
+            # other targets in that family it has no SIMT support.  Base the
+            # feature selection on the requested target rather than only the
+            # locally installed device so remote compilation behaves the same.
             if options.compile_on_910_95 is None:
-                object.__setattr__(options, "compile_on_910_95", is_compile_on_910_95())
+                object.__setattr__(options, "compile_on_910_95", is_910_95_family_arch(self.target.arch))
             # Lazy init enable_dynamic_cv_pipeline if not provided
             if options.enable_dynamic_cv_pipeline is None:
-                object.__setattr__(options, "enable_dynamic_cv_pipeline", is_compile_on_910_95())
+                object.__setattr__(options, "enable_dynamic_cv_pipeline", is_910_95_family_arch(self.target.arch))
+            if not is_simt_supported(self.target.arch):
+                if options.compile_mode == "simt_only":
+                    raise ValueError("compile_mode='simt_only' is not supported on Kirin9020")
+                object.__setattr__(options, "force_simt_only", False)
+                object.__setattr__(options, "force_simt_template", False)
+                object.__setattr__(options, "parallel_mode", "simd")
+                object.__setattr__(options, "compile_mode", "simd")
             # Costmodel path should avoid extra BC<->MLIR conversion stages
             # to keep compile-only autotune routing lightweight and stable.
             if getattr(options, "enable_costmodel_backend", False):
