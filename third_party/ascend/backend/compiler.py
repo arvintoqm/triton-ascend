@@ -59,6 +59,7 @@ from triton.backends.ascend.utils import (
     get_cann_version_file_hash,
     is_910_95_family_arch,
     is_simt_supported,
+    KIRIN_9020_ARCH,
 )
 from triton.backends.ascend.driver import (NPUUtils)
 from triton.backends.compiler import (
@@ -151,6 +152,23 @@ def make_ttir(mod, metadata, opt):
         dump_manager.put(str(mod), "kernel.ttir.mlir", binary=False)
 
     return mod
+
+
+_TO_TENSOR_EXPLICIT_RESULT_RE = re.compile(
+    r"(bufferization\.to_tensor[^\n]*:\s*memref<([^,<>'\"\s]+)>)\s+to\s+tensor<\2>")
+
+
+def _normalize_to_tensor_syntax_for_target(linalg: str, arch: str) -> str:
+    """Use the compact to_tensor syntax required by the Kirin middle end.
+
+    Only remove an explicit tensor result type when it exactly matches the
+    shape and element type of a layout-free memref operand.  The result type is
+    therefore still inferred by MLIR and the operation's semantics are
+    unchanged.
+    """
+    if arch != KIRIN_9020_ARCH:
+        return linalg
+    return _TO_TENSOR_EXPLICIT_RESULT_RE.sub(r"\1", linalg)
 
 
 def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
@@ -258,11 +276,13 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                                           set_workspace_multibuffer=set_workspace_multibuffer)
         _export_coalesce_metadata(mod, metadata)
 
+        linalg = _normalize_to_tensor_syntax_for_target(str(mod), opt.arch)
+
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])
-            dump_manager.put(str(mod), "kernel.ttadapter.mlir", binary=False)
+            dump_manager.put(linalg, "kernel.ttadapter.mlir", binary=False)
 
-        return str(mod)
+        return linalg
 
 
 def linalg_to_bc_by_triton_mlir_opt(linalg: str, metadata, opt):
@@ -333,6 +353,7 @@ def bc_to_linalg_by_bishengir_opt(bc_data: bytes, metadata, opt):
 
         # Read the generated MLIR text
         linalg_text = Path(mlir_path).read_text()
+        linalg_text = _normalize_to_tensor_syntax_for_target(linalg_text, opt.arch)
 
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])

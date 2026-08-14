@@ -50,6 +50,7 @@ class CompilerCostmodelContractTest(unittest.TestCase):
                 "get_cann_version_file_hash",
                 "is_910_95_family_arch",
                 "is_simt_supported",
+                "KIRIN_9020_ARCH",
         ]:
             setattr(utils_mod, name, lambda *args, **kwargs: False)
         utils_mod._get_auto_blockify_blacklist_reasons = lambda *args, **kwargs: []
@@ -95,6 +96,7 @@ class CompilerCostmodelContractTest(unittest.TestCase):
         cache_mod.get_dump_manager = lambda *args, **kwargs: dump_mgr
 
         utils_mod.is_compile_on_910_95 = lambda: False
+        utils_mod.KIRIN_9020_ARCH = "Kirin9020"
         utils_mod.is_910_95_family_arch = lambda arch: arch in ("Ascend910_9589", "Kirin9020")
         utils_mod.is_simt_supported = lambda arch: arch != "Kirin9020"
 
@@ -142,6 +144,22 @@ class CompilerCostmodelContractTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "not supported on Kirin9020"):
             backend.parse_options({"compile_mode": "simt_only"})
+
+    def test_kirin9020_uses_compact_to_tensor_syntax(self):
+        cmplr, _dump_mgr, _GPUTarget = self._load_compiler_module()
+        explicit = (
+            "%0 = bufferization.to_tensor %arg0 restrict writable "
+            ": memref<?xf32> to tensor<?xf32>\n")
+        compact = (
+            "%0 = bufferization.to_tensor %arg0 restrict writable "
+            ": memref<?xf32>\n")
+
+        self.assertEqual(cmplr._normalize_to_tensor_syntax_for_target(explicit, "Kirin9020"), compact)
+        self.assertEqual(cmplr._normalize_to_tensor_syntax_for_target(explicit, "Ascend910_9589"), explicit)
+
+        # Do not erase a result type that cannot be inferred from the memref.
+        mismatched = explicit.replace("tensor<?xf32>", "tensor<16xf32>")
+        self.assertEqual(cmplr._normalize_to_tensor_syntax_for_target(mismatched, "Kirin9020"), mismatched)
 
 
 if __name__ == "__main__":
