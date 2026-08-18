@@ -137,6 +137,8 @@ static bool isAllTrueMask(Value value) {
     return llvm::all_of(dense.getValues<APInt>(),
                         [](const APInt &value) { return value.isOne(); });
   }
+  if (auto broadcast = value.getDefiningOp<BroadcastOp>())
+    return isAllTrueMask(broadcast.getSrc());
   if (auto splat = value.getDefiningOp<SplatOp>()) {
     if (auto constant = splat.getSrc().getDefiningOp<arith::ConstantIntOp>())
       return constant.value() == 1;
@@ -172,7 +174,27 @@ static bool isAllTrueMask(Value value) {
   return true;
 }
 
+static FailureOr<StaticTensor> evaluatePointerOffset(Value value) {
+  if (auto addPtr = value.getDefiningOp<AddPtrOp>()) {
+    auto ownOffset = evaluate(addPtr.getOffset());
+    if (failed(ownOffset))
+      return failure();
+    auto parent = addPtr.getPtr().getDefiningOp<AddPtrOp>();
+    if (!parent)
+      return ownOffset;
+    auto parentOffset = evaluatePointerOffset(parent.getResult());
+    if (failed(parentOffset) || parentOffset->shape != ownOffset->shape)
+      return failure();
+    for (size_t i = 0; i < ownOffset->values.size(); ++i)
+      ownOffset->values[i] += parentOffset->values[i];
+    return ownOffset;
+  }
+  return failure();
+}
+
 static Value scalarBase(Value value) {
+  if (auto addPtr = value.getDefiningOp<AddPtrOp>())
+    return scalarBase(addPtr.getPtr());
   if (auto splat = value.getDefiningOp<SplatOp>())
     return splat.getSrc();
   if (auto broadcast = value.getDefiningOp<BroadcastOp>())
@@ -269,7 +291,7 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
     return reject("result rank is not 2");
   if (!addptr)
     return reject("pointer producer is not tt.addptr");
-  auto offsets = evaluate(addptr.getOffset());
+  auto offsets = evaluatePointerOffset(op.getPtr());
   if (failed(offsets))
     return reject("offset expression is not statically evaluable");
   if (offsets->shape != resultType.getShape())
