@@ -22,7 +22,6 @@
 
 #include "TritonToStructured/TritonToStructuredPass.h"
 #include "TritonToStructured/PackedLoadRewrite.h"
-#include "TritonToStructured/PackedLoadRewrite.h"
 
 #include <cassert>
 #include <cstdint>
@@ -147,7 +146,8 @@ void TritonToStructuredPass::runOnOperation() {
 
   if (enablePackedLoadRewrite) {
     RewritePatternSet packedPatterns(&getContext());
-    packedPatterns.add<PackedLoadRewrite>(&getContext());
+    PackedLoadRewriteState state;
+    packedPatterns.add<PackedLoadRewrite>(&getContext(), &state);
     if (failed(applyPatternsGreedily(moduleOp, std::move(packedPatterns))))
       moduleOp.emitWarning("PackedLoadRewrite failed");
   }

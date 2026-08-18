@@ -183,10 +183,37 @@ static FailureOr<StaticTensor> evaluatePointerOffset(Value value) {
     if (!parent)
       return ownOffset;
     auto parentOffset = evaluatePointerOffset(parent.getResult());
-    if (failed(parentOffset) || parentOffset->shape != ownOffset->shape)
+    if (failed(parentOffset))
       return failure();
-    for (size_t i = 0; i < ownOffset->values.size(); ++i)
-      ownOffset->values[i] += parentOffset->values[i];
+    if (parentOffset->shape == ownOffset->shape) {
+      for (size_t i = 0; i < ownOffset->values.size(); ++i)
+        ownOffset->values[i] += parentOffset->values[i];
+    } else {
+      if (parentOffset->shape.size() != ownOffset->shape.size())
+        return failure();
+      SmallVector<int64_t> parentStrides(parentOffset->shape.size(), 1);
+      SmallVector<int64_t> ownStrides(ownOffset->shape.size(), 1);
+      for (int64_t i = parentOffset->shape.size() - 2; i >= 0; --i)
+        parentStrides[i] = parentStrides[i + 1] * parentOffset->shape[i + 1];
+      for (int64_t i = ownOffset->shape.size() - 2; i >= 0; --i)
+        ownStrides[i] = ownStrides[i + 1] * ownOffset->shape[i + 1];
+      for (size_t dim = 0; dim < ownOffset->shape.size(); ++dim)
+        if (parentOffset->shape[dim] != 1 &&
+            parentOffset->shape[dim] != ownOffset->shape[dim])
+          return failure();
+      for (int64_t linear = 0;
+           linear < static_cast<int64_t>(ownOffset->values.size()); ++linear) {
+        int64_t remainder = linear;
+        int64_t parentLinear = 0;
+        for (size_t dim = 0; dim < ownOffset->shape.size(); ++dim) {
+          int64_t coordinate = remainder / ownStrides[dim];
+          remainder %= ownStrides[dim];
+          if (parentOffset->shape[dim] != 1)
+            parentLinear += coordinate * parentStrides[dim];
+        }
+        ownOffset->values[linear] += parentOffset->values[parentLinear];
+      }
+    }
     return ownOffset;
   }
   return failure();
@@ -306,8 +333,13 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
   bool w3qs = succeeded(w3qsPair);
   int64_t physical = (w3qh || w3qs) ? rows * (columns / 32) * (w3qs ? 8 : 4)
                           : rows * (columns / 2);
-  Value compact = createCompactLoad(op.getLoc(), scalarBase(addptr.getPtr()),
-                                     physical, rewriter);
+  Value base = scalarBase(addptr.getPtr());
+  Value compact = state ? state->compactLoads.lookup({base, physical}) : Value();
+  if (!compact) {
+    compact = createCompactLoad(op.getLoc(), base, physical, rewriter);
+    if (state && compact)
+      state->compactLoads[{base, physical}] = compact;
+  }
   if (!compact)
     return reject("base pointer is not a scalar tt.ptr");
   auto compactType = cast<RankedTensorType>(compact.getType());
