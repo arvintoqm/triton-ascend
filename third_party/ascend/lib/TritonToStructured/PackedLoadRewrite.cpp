@@ -179,7 +179,10 @@ static FailureOr<StaticTensor> evaluatePointerOffset(Value value) {
     auto ownOffset = evaluate(addPtr.getOffset());
     if (failed(ownOffset))
       return failure();
-    auto parent = addPtr.getPtr().getDefiningOp<AddPtrOp>();
+    Value parentValue = addPtr.getPtr();
+    while (auto broadcast = parentValue.getDefiningOp<BroadcastOp>())
+      parentValue = broadcast.getSrc();
+    auto parent = parentValue.getDefiningOp<AddPtrOp>();
     if (!parent)
       return ownOffset;
     auto parentOffset = evaluatePointerOffset(parent.getResult());
@@ -336,6 +339,11 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
   Value base = scalarBase(addptr.getPtr());
   Value compact = state ? state->compactLoads.lookup({base, physical}) : Value();
   if (!compact) {
+    OpBuilder::InsertionGuard guard(rewriter);
+    auto function = op->getParentOfType<triton::FuncOp>();
+    if (!function || function.getBody().empty())
+      return reject("load is not nested in a function body");
+    rewriter.setInsertionPointToStart(&function.getBody().front());
     compact = createCompactLoad(op.getLoc(), base, physical, rewriter);
     if (state && compact)
       state->compactLoads[{base, physical}] = compact;
