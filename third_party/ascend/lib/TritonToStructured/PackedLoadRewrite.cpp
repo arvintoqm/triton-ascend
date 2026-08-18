@@ -180,8 +180,10 @@ static Value createCompactLoad(Location loc, Value base, int64_t elements,
   auto range = rewriter.create<MakeRangeOp>(loc, indexType, 0, elements);
   auto splat = rewriter.create<SplatOp>(loc, ptrType, base);
   auto ptr = rewriter.create<AddPtrOp>(loc, ptrType, splat, range);
-  return rewriter.create<LoadOp>(loc, ptr, nullptr, nullptr, nullptr, nullptr,
-                                 false).getResult();
+  return rewriter
+      .create<LoadOp>(loc, ptr.getResult(), nullptr, nullptr,
+                      CacheModifier::NONE, EvictionPolicy::NORMAL, false)
+      .getResult();
 }
 } // namespace
 

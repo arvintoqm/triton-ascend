@@ -364,6 +364,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
         enableMaskFallbackConversion, optimizeDynamicOffset,
         enablePackedLoadRewrite));
       },
+      py::arg("pm"),
       py::arg("enable_mask_fallback_conversion"),
       py::arg("optimize_dynamic_offset"),
       py::arg("enable_packed_load_rewrite") = false);

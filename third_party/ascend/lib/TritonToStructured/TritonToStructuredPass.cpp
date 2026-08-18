@@ -21,6 +21,7 @@
  */
 
 #include "TritonToStructured/TritonToStructuredPass.h"
+#include "TritonToStructured/PackedLoadRewrite.h"
 
 #include <cassert>
 #include <cstdint>
@@ -128,7 +129,7 @@ void TritonToStructuredPass::runOnOperation() {
   this->populateTritonToStructuredCanonicalizationPatterns(
       canonicalizerPatterns);
   if (enablePackedLoadRewrite)
-    canonicalizerPatterns.add<PackedLoadRewrite>(getContext());
+    canonicalizerPatterns.add<PackedLoadRewrite>(&getContext());
   if (failed(
           applyPatternsGreedily(moduleOp, std::move(canonicalizerPatterns)))) {
     moduleOp.emitWarning("Canonicalize failed");

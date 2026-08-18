@@ -27,7 +27,6 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
-#include "TritonToStructured/PackedLoadRewrite.h"
 
 #define GEN_PASS_CLASSES
 #include "ascend/include/TritonToStructured/Passes.h.inc"
@@ -38,7 +37,7 @@ namespace triton {
 std::unique_ptr<OperationPass<ModuleOp>> createTritonToStructuredPass();
 
 std::unique_ptr<OperationPass<ModuleOp>> createTritonToStructuredPass(
-  bool, bool, bool = false);
+    bool, bool, bool = false);
 
 } // namespace triton
 } // namespace mlir
