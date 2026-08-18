@@ -127,6 +127,8 @@ void TritonToStructuredPass::runOnOperation() {
 
   this->populateTritonToStructuredCanonicalizationPatterns(
       canonicalizerPatterns);
+  if (enablePackedLoadRewrite)
+    canonicalizerPatterns.add<PackedLoadRewrite>(getContext());
   if (failed(
           applyPatternsGreedily(moduleOp, std::move(canonicalizerPatterns)))) {
     moduleOp.emitWarning("Canonicalize failed");
@@ -161,7 +163,9 @@ triton::createTritonToStructuredPass() {
 
 std::unique_ptr<OperationPass<ModuleOp>>
 triton::createTritonToStructuredPass(bool enableMaskFallbackConversion,
-                                     bool optimizeDynamicOffset) {
+                                     bool optimizeDynamicOffset,
+                                     bool enablePackedLoadRewrite) {
   return std::make_unique<TritonToStructuredPass>(enableMaskFallbackConversion,
-                                                  optimizeDynamicOffset);
+                                                  optimizeDynamicOffset,
+                                                  enablePackedLoadRewrite);
 }

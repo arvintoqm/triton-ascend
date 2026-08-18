@@ -27,6 +27,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "TritonToStructured/PackedLoadRewrite.h"
 
 #define GEN_PASS_CLASSES
 #include "ascend/include/TritonToStructured/Passes.h.inc"
@@ -36,8 +37,8 @@ namespace triton {
 
 std::unique_ptr<OperationPass<ModuleOp>> createTritonToStructuredPass();
 
-std::unique_ptr<OperationPass<ModuleOp>> createTritonToStructuredPass(bool,
-                                                                      bool);
+std::unique_ptr<OperationPass<ModuleOp>> createTritonToStructuredPass(
+  bool, bool, bool = false);
 
 } // namespace triton
 } // namespace mlir
@@ -51,9 +52,11 @@ public:
   TritonToStructuredPass() = default;
 
   TritonToStructuredPass(bool enableMaskFallbackConversion,
-                         bool optimizeDynamicOffset) {
+                         bool optimizeDynamicOffset,
+                         bool enablePackedLoadRewrite = false) {
     this->enableMaskFallbackConversion = enableMaskFallbackConversion;
     this->optimizeDynamicOffset = optimizeDynamicOffset;
+    this->enablePackedLoadRewrite = enablePackedLoadRewrite;
   };
   void getDependentDialects(DialectRegistry &registry) const override;
   void runOnOperation() override;
@@ -67,6 +70,7 @@ private:
                                           bool enableMaskFallbackConversion);
 
   LogicalResult processSplatBinaryOperations(ModuleOp moduleOp);
+
 };
 
 #endif // TRITON_ADAPTER_CONVERSION_TRITONTOSTRUCTURED_H
