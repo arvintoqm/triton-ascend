@@ -199,7 +199,16 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         force_simt_template = metadata["force_simt_template"]
         enable_sync_block_lock = metadata["enable_sync_block_lock"]
         enable_mask_fallback_conversion = metadata["enable_mask_fallback_conversion"]
-        enable_packed_load_rewrite = metadata.get("enable_packed_load_rewrite", False)
+        # This is a compiler option, not launch metadata. Reading only from
+        # metadata silently disabled the rewrite for normal kernel builds.
+        enable_packed_load_rewrite = getattr(
+            opt, "enable_packed_load_rewrite", False
+        )
+        if opt.debug:
+            print(
+                "PackedLoadRewrite pipeline option: "
+                f"enable_packed_load_rewrite={enable_packed_load_rewrite}"
+            )
         optimize_dynamic_offset = metadata["optimize_dynamic_offset"]
         auto_blockify_size = metadata["auto_blockify_size"]
         enable_mixed_cv = metadata.get("enable_mixed_cv")
@@ -1258,6 +1267,8 @@ class AscendBackend(BaseBackend):
                 object.__setattr__(options, "force_simt_template", False)
                 object.__setattr__(options, "parallel_mode", "simd")
                 object.__setattr__(options, "compile_mode", "simd")
+            if self.target.arch == KIRIN_9020_ARCH and "enable_packed_load_rewrite" not in opts:
+                object.__setattr__(options, "enable_packed_load_rewrite", True)
             # Costmodel path should avoid extra BC<->MLIR conversion stages
             # to keep compile-only autotune routing lightweight and stable.
             if getattr(options, "enable_costmodel_backend", False):

@@ -114,7 +114,62 @@ static FailureOr<StaticTensor> evaluate(Value value) {
     return binary(band.getLhs(), band.getRhs(), [](int64_t a, int64_t b) { return a & b; });
   if (auto shr = value.getDefiningOp<arith::ShRSIOp>())
     return binary(shr.getLhs(), shr.getRhs(), [](int64_t a, int64_t b) { return a >> b; });
+  if (auto shl = value.getDefiningOp<arith::ShLIOp>())
+    return binary(shl.getLhs(), shl.getRhs(), [](int64_t a, int64_t b) { return a << b; });
+  if (auto add = value.getDefiningOp<arith::SubIOp>())
+    return binary(add.getLhs(), add.getRhs(), [](int64_t a, int64_t b) { return a - b; });
+  if (auto cast = value.getDefiningOp<arith::ExtSIOp>())
+    return evaluate(cast.getIn());
+  if (auto cast = value.getDefiningOp<arith::IndexCastOp>())
+    return evaluate(cast.getIn());
   return failure();
+}
+
+static bool isAllTrueMask(Value value) {
+  auto maskType = dyn_cast<RankedTensorType>(value.getType());
+  if (!maskType || !maskType.hasStaticShape() ||
+      !maskType.getElementType().isInteger(1))
+    return false;
+  if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
+    auto dense = dyn_cast<DenseIntOrFPElementsAttr>(constant.getValue());
+    if (!dense)
+      return false;
+    return llvm::all_of(dense.getValues<APInt>(),
+                        [](const APInt &value) { return value.isOne(); });
+  }
+  if (auto splat = value.getDefiningOp<SplatOp>()) {
+    if (auto constant = splat.getSrc().getDefiningOp<arith::ConstantIntOp>())
+      return constant.value() == 1;
+    return false;
+  }
+  auto cmp = value.getDefiningOp<arith::CmpIOp>();
+  if (!cmp)
+    return false;
+  auto lhs = evaluate(cmp.getLhs());
+  auto rhs = evaluate(cmp.getRhs());
+  if (failed(lhs) || failed(rhs) || lhs->shape != rhs->shape)
+    return false;
+  auto predicate = cmp.getPredicate();
+  for (size_t i = 0; i < lhs->values.size(); ++i) {
+    int64_t left = lhs->values[i];
+    int64_t right = rhs->values[i];
+    bool result = false;
+    switch (predicate) {
+    case arith::CmpIPredicate::eq: result = left == right; break;
+    case arith::CmpIPredicate::ne: result = left != right; break;
+    case arith::CmpIPredicate::slt: result = left < right; break;
+    case arith::CmpIPredicate::sle: result = left <= right; break;
+    case arith::CmpIPredicate::sgt: result = left > right; break;
+    case arith::CmpIPredicate::sge: result = left >= right; break;
+    case arith::CmpIPredicate::ult: result = static_cast<uint64_t>(left) < static_cast<uint64_t>(right); break;
+    case arith::CmpIPredicate::ule: result = static_cast<uint64_t>(left) <= static_cast<uint64_t>(right); break;
+    case arith::CmpIPredicate::ugt: result = static_cast<uint64_t>(left) > static_cast<uint64_t>(right); break;
+    case arith::CmpIPredicate::uge: result = static_cast<uint64_t>(left) >= static_cast<uint64_t>(right); break;
+    }
+    if (!result)
+      return false;
+  }
+  return true;
 }
 
 static Value scalarBase(Value value) {
@@ -189,30 +244,50 @@ static Value createCompactLoad(Location loc, Value base, int64_t elements,
 
 LogicalResult PackedLoadRewrite::matchAndRewrite(
     LoadOp op, PatternRewriter &rewriter) const {
-  if (op.getMask() || op.getOther())
+  auto reject = [&](StringRef reason) -> LogicalResult {
+    op.emitRemark() << "PackedLoadRewrite candidate: matched=no reason="
+                    << reason;
     return failure();
+  };
   auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
+  auto pointer = op.getPtr().getDefiningOp();
+  op.emitRemark() << "PackedLoadRewrite candidate: shape="
+                  << (resultType ? resultType.getShape() : ArrayRef<int64_t>())
+                  << " pointer="
+                  << (pointer ? pointer->getName().getStringRef()
+                               : StringRef("<block-argument>"));
+  if (op.getMask() && !isAllTrueMask(op.getMask()))
+    return reject("unsupported mask");
+  if (op.getOther() && !op.getMask())
+    return reject("unsupported other value");
   auto addptr = op.getPtr().getDefiningOp<AddPtrOp>();
-  if (!resultType || !resultType.hasStaticShape() || resultType.getRank() != 2 ||
-      !addptr)
-    return failure();
+  if (!resultType)
+    return reject("result is not a ranked tensor");
+  if (!resultType.hasStaticShape())
+    return reject("result shape is dynamic");
+  if (resultType.getRank() != 2)
+    return reject("result rank is not 2");
+  if (!addptr)
+    return reject("pointer producer is not tt.addptr");
   auto offsets = evaluate(addptr.getOffset());
-  if (failed(offsets) || offsets->shape != resultType.getShape())
-    return failure();
+  if (failed(offsets))
+    return reject("offset expression is not statically evaluable");
+  if (offsets->shape != resultType.getShape())
+    return reject("offset shape differs from result shape");
   int64_t rows = resultType.getShape()[0];
   int64_t columns = resultType.getShape()[1];
   bool w3qh = isW3QH(offsets->values, rows, columns);
   auto w3qsPair = isW3QS(offsets->values, rows, columns);
   bool w4 = isW4(offsets->values, rows, columns);
   if (!w3qh && failed(w3qsPair) && !w4)
-    return failure();
+    return reject("offset map is not W3-QH or W3-QS");
   bool w3qs = succeeded(w3qsPair);
   int64_t physical = (w3qh || w3qs) ? rows * (columns / 32) * (w3qs ? 8 : 4)
                           : rows * (columns / 2);
   Value compact = createCompactLoad(op.getLoc(), scalarBase(addptr.getPtr()),
                                      physical, rewriter);
   if (!compact)
-    return failure();
+    return reject("base pointer is not a scalar tt.ptr");
   auto compactType = cast<RankedTensorType>(compact.getType());
     SmallVector<int64_t> packedShape =
       (w3qh || w3qs) ? SmallVector<int64_t>{rows, columns / 32, w3qs ? 4 : 4}

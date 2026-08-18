@@ -22,6 +22,7 @@
 
 #include "TritonToStructured/TritonToStructuredPass.h"
 #include "TritonToStructured/PackedLoadRewrite.h"
+#include "TritonToStructured/PackedLoadRewrite.h"
 
 #include <cassert>
 #include <cstdint>
@@ -124,12 +125,34 @@ TritonToStructuredPass::processSplatBinaryOperations(ModuleOp moduleOp) {
 void TritonToStructuredPass::runOnOperation() {
   auto moduleOp = getOperation();
   ConversionTarget target(getContext());
+  unsigned loadCount = 0;
+  moduleOp.walk([&](triton::LoadOp load) {
+    ++loadCount;
+    auto resultType = dyn_cast<RankedTensorType>(load.getResult().getType());
+    auto pointer = load.getPtr().getDefiningOp();
+    auto diag = load.emitRemark() << "PackedLoadRewrite LoadOp: shape=";
+    if (resultType)
+      diag << resultType.getShape();
+    else
+      diag << "<non-ranked>";
+    diag << " pointer=" << (pointer ? pointer->getName().getStringRef()
+                                      : StringRef("<block-argument>"))
+         << " mask=" << (load.getMask() ? "present" : "absent")
+         << " other=" << (load.getOther() ? "present" : "absent");
+  });
+  moduleOp.emitRemark() << "PackedLoadRewrite pass start: enabled="
+                        << (enablePackedLoadRewrite ? "true" : "false")
+                        << " triton.LoadOp count=" << loadCount;
   RewritePatternSet canonicalizerPatterns(&getContext());
 
+  if (enablePackedLoadRewrite) {
+    RewritePatternSet packedPatterns(&getContext());
+    packedPatterns.add<PackedLoadRewrite>(&getContext());
+    if (failed(applyPatternsGreedily(moduleOp, std::move(packedPatterns))))
+      moduleOp.emitWarning("PackedLoadRewrite failed");
+  }
   this->populateTritonToStructuredCanonicalizationPatterns(
       canonicalizerPatterns);
-  if (enablePackedLoadRewrite)
-    canonicalizerPatterns.add<PackedLoadRewrite>(&getContext());
   if (failed(
           applyPatternsGreedily(moduleOp, std::move(canonicalizerPatterns)))) {
     moduleOp.emitWarning("Canonicalize failed");
