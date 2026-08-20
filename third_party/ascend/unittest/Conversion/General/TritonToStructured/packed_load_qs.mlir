@@ -1,3 +1,8 @@
+// This regression test covers the W3-QS packed-weight case.
+// The logical matrix is derived from row/column coordinates using the packed
+// offset formula used by quantized weights.  The rewrite aims to prove that the
+// load can be converted into a compact physical load and then reconstructed to
+// the original logical tensor view.
 // RUN: triton-opt '--triton-to-structured=enable-packed-load-rewrite=true' %s | FileCheck %s
 
 module {
@@ -36,6 +41,10 @@ module {
   }
 }
 
+// The CHECK lines below assert the important observable behavior:
+//  - the original element-wise offset arithmetic is folded into a compact range
+//  - a slice/extract is used to grab the packed data view
+//  - the result is then broadcast back to the logical tensor layout
 // CHECK-LABEL: tt.func public @w3_qs
 // CHECK: tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32>
 // CHECK: tensor.extract_slice

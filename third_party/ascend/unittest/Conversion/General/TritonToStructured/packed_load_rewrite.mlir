@@ -1,3 +1,8 @@
+// These tests describe the packed-memory layouts used by qweights in the
+// Ascend backend.  The intent is to keep the IR shape/offset logic visible to
+// future readers: each function constructs a logical 2-D matrix, applies the
+// storage formula for the compact layout, and then verifies the rewrite returns
+// to the original logical tensor form.
 // RUN: triton-opt '--triton-to-structured=enable-packed-load-rewrite=true' --split-input-file %s | FileCheck %s
 
 module {
@@ -32,6 +37,9 @@ module {
   }
 }
 
+// W3-QH: the compact buffer is smaller than the logical matrix, so the pass
+// must materialize a range that matches the compact storage and then reshape it
+// back into the logical matrix view.
 // CHECK-LABEL: tt.func public @w3_qh
 // CHECK: tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
 // CHECK: tt.load
@@ -72,6 +80,9 @@ module {
   }
 }
 
+// W3-QH with a larger width keeps the same rewrite pattern but changes the
+// compact physical size.  The important part is that the pass still recognizes
+// the same offset formula for the larger packed matrix.
 // CHECK-LABEL: tt.func public @w3_qh_k1024
 // CHECK: tt.make_range {end = 2048 : i32, start = 0 : i32} : tensor<2048xi32>
 
@@ -106,6 +117,9 @@ module {
   }
 }
 
+// W4 packs the logical matrix by a different formula; this branch confirms the
+// rewrite still recognizes the alternative mapping and emits the compact load
+// required for the physical buffer.
 // CHECK-LABEL: tt.func public @w4
 // CHECK: tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32>
 // CHECK: tt.load
@@ -122,6 +136,9 @@ module {
   }
 }
 
+// The last case verifies that irregular loads are intentionally left alone.  If
+// the access pattern does not match one of the recognized packed layouts, the
+// pass must not rewrite it.
 // CHECK-LABEL: tt.func public @irregular
 // CHECK: tt.load
 // CHECK-NOT: tt.make_range {end = 256 : i32, start = 0 : i32}

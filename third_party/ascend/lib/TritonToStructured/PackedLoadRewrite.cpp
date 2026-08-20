@@ -14,12 +14,28 @@ using namespace mlir;
 using namespace mlir::triton;
 
 namespace {
+// The packed-load rewrite handles a very specific class of kernels: logical
+// 2-D tensors that are stored in a compressed memory layout for qweight packs
+// (W3-QH, W3-QS, and W4).  The rewrite does not change the kernel's meaning;
+// it only recognizes the special offset pattern, loads the compact buffer once,
+// and reshapes/broadcasts the values back to the logical tensor shape.
 struct StaticTensor {
   SmallVector<int64_t> shape;
   SmallVector<int64_t> values;
 };
 
+// Small constant-folding evaluator used to recognize statically known pointer
+// arithmetic.  This function is intentionally narrow: it accepts only a subset
+// of tensor-producing ops that appear in the packed qweight offset pattern.
+//
+// The reason it exists is simple: before the pass rewrites a load, it must prove
+// that the offset expression is a compile-time-known tensor with the exact shape
+// required by a packed layout.  Once that proof succeeds, the code can inspect
+// the offset table and decide whether the load is W3-QH, W3-QS, or W4.
 static FailureOr<StaticTensor> evaluate(Value value) {
+  // The evaluator only handles ranked tensors whose shape is fixed at compile
+  // time and whose element type is an integer/index.  That is enough for the
+  // packed-load offset expressions created by make_range + broadcast + arithmetic.
   auto type = dyn_cast<RankedTensorType>(value.getType());
   if (!type || !type.hasStaticShape() || !type.getElementType().isIntOrIndex())
     return failure();
@@ -27,6 +43,8 @@ static FailureOr<StaticTensor> evaluate(Value value) {
   result.shape.assign(type.getShape().begin(), type.getShape().end());
   result.values.resize(type.getNumElements());
 
+  // A simple make_range value is one of the easiest cases to evaluate: it is a
+  // dense 1-D tensor of successive integers.
   if (auto range = value.getDefiningOp<MakeRangeOp>()) {
     if (result.shape.size() != 1 || range.getStart() < 0 ||
         range.getEnd() - range.getStart() != result.shape[0])
@@ -35,6 +53,10 @@ static FailureOr<StaticTensor> evaluate(Value value) {
       result.values[i] = range.getStart() + i;
     return result;
   }
+
+  // A constant tensor is evaluated element-by-element.  This covers the constant
+  // seeds used in the packed offset construction, like splats and simple
+  // integer constants that are later combined by arithmetic.
   if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
     auto dense = dyn_cast<DenseIntOrFPElementsAttr>(constant.getValue());
     if (!dense || dense.getNumElements() != result.values.size())
@@ -43,6 +65,9 @@ static FailureOr<StaticTensor> evaluate(Value value) {
       result.values[it.index()] = it.value().getSExtValue();
     return result;
   }
+
+  // A splat is effectively a scalar broadcast; once the scalar is a constant,
+  // every element in the tensor has the same value.
   if (auto splat = value.getDefiningOp<SplatOp>()) {
     auto scalar = splat.getSrc();
     auto scalarConst = scalar.getDefiningOp<arith::ConstantIntOp>();
@@ -52,6 +77,10 @@ static FailureOr<StaticTensor> evaluate(Value value) {
               scalarConst.value());
     return result;
   }
+
+  // ExpandDims does not change the underlying values; it only inserts a size-1
+  // axis.  The evaluator therefore keeps the same flat backing array and checks
+  // that the inserted dimension matches the expected shape.
   if (auto expand = value.getDefiningOp<ExpandDimsOp>()) {
     auto source = evaluate(expand.getSrc());
     if (failed(source))
@@ -68,6 +97,10 @@ static FailureOr<StaticTensor> evaluate(Value value) {
     result.values = source->values;
     return result;
   }
+
+  // Broadcast is the main shape-lifting operation for the packed offset pattern.
+  // The source is repeated across the leading broadcasted dimensions, and we map
+  // the logical linear index back to the source's linear index via stride math.
   if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
     auto source = evaluate(broadcast.getSrc());
     if (failed(source) || source->shape.size() > result.shape.size())
@@ -96,6 +129,10 @@ static FailureOr<StaticTensor> evaluate(Value value) {
     }
     return result;
   }
+
+  // Binary operations are the last piece of the offset pattern.  The code below
+  // accepts arithmetic used in the packed memory formula, like add, mul, shift,
+  // and mask operations, and folds them element-by-element.
   auto binary = [&](Value lhs, Value rhs, auto operation) -> FailureOr<StaticTensor> {
     auto left = evaluate(lhs);
     auto right = evaluate(rhs);
@@ -174,24 +211,48 @@ static bool isAllTrueMask(Value value) {
   return true;
 }
 
+// evaluatePointerOffset is the key recognizer: it converts a pointer expression
+// like a nested tt.addptr + broadcast chain into a flat tensor of byte offsets.
+// Once we have that tensor, we can compare it against the known packed-weight
+// formulas and decide whether the logical dense load can be replaced by a compact
+// memory load.
+//
+// The important detail is that the offset is not always a simple local value.
+// It may be built from multiple nested addptrs, where the parent adds a base
+// offset and the child adds a per-element offset.  We fold those together into a
+// single offset table before checking the layout.
 static FailureOr<StaticTensor> evaluatePointerOffset(Value value) {
   if (auto addPtr = value.getDefiningOp<AddPtrOp>()) {
+    // Step 1: evaluate the offset contributed by this addptr itself.
     auto ownOffset = evaluate(addPtr.getOffset());
     if (failed(ownOffset))
       return failure();
+
+    // Step 2: walk through any broadcast wrappers to reach the underlying base
+    // pointer, then check whether the parent pointer also contributes a
+    // nontrivial offset.
     Value parentValue = addPtr.getPtr();
     while (auto broadcast = parentValue.getDefiningOp<BroadcastOp>())
       parentValue = broadcast.getSrc();
     auto parent = parentValue.getDefiningOp<AddPtrOp>();
     if (!parent)
       return ownOffset;
+
     auto parentOffset = evaluatePointerOffset(parent.getResult());
     if (failed(parentOffset))
       return failure();
+
+    // If both parent and child offsets share the same logical shape, simply add
+    // them elementwise.  This is the common case for a tensor pointer built from
+    // a scalar base plus a tensor offset.
     if (parentOffset->shape == ownOffset->shape) {
       for (size_t i = 0; i < ownOffset->values.size(); ++i)
         ownOffset->values[i] += parentOffset->values[i];
     } else {
+      // Some pointer chains are broadcasted or reshaped, so the parent and child
+      // offsets may differ in shape while still describing the same logical
+      // tensor.  In that case, we map the parent offset back into the child's
+      // linearized index space using simple stride arithmetic.
       if (parentOffset->shape.size() != ownOffset->shape.size())
         return failure();
       SmallVector<int64_t> parentStrides(parentOffset->shape.size(), 1);
@@ -232,6 +293,9 @@ static Value scalarBase(Value value) {
   return value;
 }
 
+// W3-QH uses a row-major packed layout where each 32-element column group is
+// physically stored in a compact sub-tile.  The offset formula below matches the
+// actual memory ordering used by the upstream qweight packer.
 static bool isW3QH(ArrayRef<int64_t> offsets, int64_t rows, int64_t columns) {
   if (columns % 32 != 0)
     return false;
@@ -277,6 +341,10 @@ static bool isW4(ArrayRef<int64_t> offsets, int64_t rows, int64_t columns) {
   return true;
 }
 
+// The compact load is the central optimization: instead of materializing a
+// full logical tensor load through the packed layout, we emit a single scalar
+// base-pointer load covering the compact physical buffer and then reconstruct
+// the logical layout with reshape/broadcast operations.
 static Value createCompactLoad(Location loc, Value base, int64_t elements,
                                PatternRewriter &rewriter) {
   auto basePtr = dyn_cast<PointerType>(base.getType());
@@ -294,6 +362,10 @@ static Value createCompactLoad(Location loc, Value base, int64_t elements,
 }
 } // namespace
 
+// matchAndRewrite is the actual translation point.  We only trigger when a
+// load is a 2-D tensor load whose pointer arithmetic follows the packed storage
+// formula used by qweights.  Once recognized, the pass swaps the expensive
+// irregular access pattern for a compact load plus shape restoration.
 LogicalResult PackedLoadRewrite::matchAndRewrite(
     LoadOp op, PatternRewriter &rewriter) const {
   auto reject = [&](StringRef reason) -> LogicalResult {
@@ -331,11 +403,21 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
   bool w3qh = isW3QH(offsets->values, rows, columns);
   auto w3qsPair = isW3QS(offsets->values, rows, columns);
   bool w4 = isW4(offsets->values, rows, columns);
+  // If the offset table does not match any packaged-memory pattern, there is
+  // no compact-load optimization to apply and the original load must be kept as
+  //-is.
   if (!w3qh && failed(w3qsPair) && !w4)
     return reject("offset map is not W3-QH or W3-QS");
   bool w3qs = succeeded(w3qsPair);
+
+  // The physical load count is the number of elements in the compact backing
+  // buffer.  For W3-QH/W3-QS this is a packed 4/8-bit layout; for W4 it is a
+  // denser row-wise representation.
   int64_t physical = (w3qh || w3qs) ? rows * (columns / 32) * (w3qs ? 8 : 4)
                           : rows * (columns / 2);
+
+  // The rewrite emits a single compact load per base pointer and then reuses it
+  // for every logical load that shares the same backing buffer and physical size.
   Value base = scalarBase(addptr.getPtr());
   Value compact = state ? state->compactLoads.lookup({base, physical}) : Value();
   if (!compact) {
@@ -350,33 +432,41 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
   }
   if (!compact)
     return reject("base pointer is not a scalar tt.ptr");
+
+  // The compact buffer is a flat 1-D tensor.  We reshape it into the logical
+  // packed shape, then expand the packed dimension back out so it matches the
+  // original dense logical tensor layout.  The exact dimension placement depends
+  // on whether we are handling W3 or W4.
   auto compactType = cast<RankedTensorType>(compact.getType());
-    SmallVector<int64_t> packedShape =
+  SmallVector<int64_t> packedShape =
       (w3qh || w3qs) ? SmallVector<int64_t>{rows, columns / 32, w3qs ? 4 : 4}
            : SmallVector<int64_t>{rows, columns / 32, 16};
-    Value packedInput = compact;
-    if (w3qs) {
+  Value packedInput = compact;
+  if (w3qs) {
+    // For W3-QS, the packed layout carries a second axis selecting the pair
+    // slot (0 or 1).  We first reshape to a 4-D packed tensor, extract the
+    // relevant slice for this pair, and then continue with the standard reshape.
     packedShape.push_back(2);
     auto packedFull = rewriter.create<ReshapeOp>(
-      op.getLoc(), RankedTensorType::get(packedShape, compactType.getElementType()),
-      compact);
+        op.getLoc(), RankedTensorType::get(packedShape, compactType.getElementType()),
+        compact);
     SmallVector<OpFoldResult> offsets(4, rewriter.getIndexAttr(0));
     offsets[3] = rewriter.getIndexAttr(*w3qsPair);
     SmallVector<OpFoldResult> sizes = {
-      rewriter.getIndexAttr(rows), rewriter.getIndexAttr(columns / 32),
-      rewriter.getIndexAttr(4), rewriter.getIndexAttr(1)};
+        rewriter.getIndexAttr(rows), rewriter.getIndexAttr(columns / 32),
+        rewriter.getIndexAttr(4), rewriter.getIndexAttr(1)};
     SmallVector<OpFoldResult> strides(4, rewriter.getIndexAttr(1));
     auto sliceType = RankedTensorType::get(
-      {rows, columns / 32, 4, 1}, compactType.getElementType());
+        {rows, columns / 32, 4, 1}, compactType.getElementType());
     packedInput = rewriter.create<tensor::ExtractSliceOp>(
-      op.getLoc(), sliceType, packedFull.getResult(), offsets, sizes,
-      strides);
+        op.getLoc(), sliceType, packedFull.getResult(), offsets, sizes,
+        strides);
     packedShape.pop_back();
-    }
-  auto packed = rewriter.create<ReshapeOp>(op.getLoc(),
-                                           RankedTensorType::get(packedShape, compactType.getElementType()),
-                         packedInput);
-    int64_t broadcastAxis = (w3qh || w3qs) ? 3 : 2;
+  }
+  auto packed = rewriter.create<ReshapeOp>(
+      op.getLoc(), RankedTensorType::get(packedShape, compactType.getElementType()),
+      packedInput);
+  int64_t broadcastAxis = (w3qh || w3qs) ? 3 : 2;
   auto expanded = rewriter.create<ExpandDimsOp>(
       op.getLoc(), packed.getResult(), broadcastAxis);
   SmallVector<int64_t> expandedShape = packedShape;
@@ -388,6 +478,7 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
   auto restored = rewriter.create<ReshapeOp>(op.getLoc(), resultType,
                                              broadcast.getResult());
   rewriter.replaceOp(op, restored.getResult());
+
   op.emitRemark() << "PackedLoadRewrite: logical shape=" << rows << "x" << columns
                   << " physical elements=" << physical
                   << " reuse factor=" << (rows * columns) / physical
